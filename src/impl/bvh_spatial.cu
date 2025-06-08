@@ -48,11 +48,11 @@ static constexpr bool SSP_DEBUG = true;
 static constexpr float traverse_cost = 0.2f;
 static constexpr float spatial_traverse_cost = 0.21f;
 static constexpr int max_allowed_depth = 96;
-// when number of triangles to process is greater than the following,
-// `update_bin` will employ thread pool to accelerate binning
+// when number of triangles to process is less than the following,
+// the task will be executed locally instead of being queued
 static constexpr int workload_threshold = 512;
 static constexpr int number_of_workers = 8;
-static int max_depth = 0;
+static int max_depth = 0; // TODO: should not use global variable for this?
 
 // Wrapping building of a SBVH Node as a Task for queuing
 struct SBVHBuilderTask {
@@ -146,10 +146,7 @@ class SBVHBuilderThreadSpan {
     std::array<SBVHBuilderThreadSpan, 2>
     get_child_spans(const SBVHBuilderTask &lchild_task,
                     const SBVHBuilderTask &rchild_task) const {
-        if (thread_count == 0)
-            return {SBVHBuilderThreadSpan{parallel_threads, thread_base, 0},
-                    SBVHBuilderThreadSpan{parallel_threads, thread_base, 0}};
-
+        // distribute threads in proportion to prim count
         int lchild_prim_cnt = lchild_task.cur_node->prims.size();
         int rchild_prim_cnt = rchild_task.cur_node->prims.size();
 
@@ -774,6 +771,7 @@ static int recursive_sbvh_SAH(
         recursive_sbvh_SAH_impl(threads, rchild_task, recursive_sbvh_SAH_impl);
     };
 
+    // threading primitives
     std::vector<SBVHBuilderThread> parallel_threads(number_of_workers - 1);
     moodycamel::ConcurrentQueue<SBVHBuilderTask> task_queue;
     std::vector<moodycamel::ProducerToken> task_queue_producer_tokens;
@@ -837,7 +835,7 @@ static int recursive_sbvh_SAH(
 
             SBVHBuilderTask consume_task;
             // https://github.com/cameron314/concurrentqueue/blob/master/samples.md
-            // "Multithreaded game loop"
+            // refer to "Multithreaded game loop"
             while (queued_task_count.load(std::memory_order_acquire) != 0) {
                 if (!task_queue.try_dequeue(task_queue_consumer_token,
                                             consume_task))
