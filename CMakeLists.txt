@@ -85,7 +85,6 @@ add_subdirectory(src/ext/imgui)
 add_subdirectory(src/ext/glfw)
 add_subdirectory(src/ext/nanobind)
 add_subdirectory(src/ext/nanovdb)
-add_subdirectory(src/ext/concurrentqueue)
 add_subdirectory(src/ext/atomic_queue)
 
 find_package(OpenGL REQUIRED)
@@ -113,7 +112,7 @@ target_compile_options(RenderCore
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FINAL_FLAGS}>)
 
 target_link_libraries(RenderCore PRIVATE tinyxml2 tinyobjloader GLEW::glew glfw
-                                         imgui ${OPENGL_gl_LIBRARY} concurrentqueue max0x7ba::atomic_queue)
+                                         imgui ${OPENGL_gl_LIBRARY} max0x7ba::atomic_queue)
 
 set(EXEC1_NAME "pt")
 add_executable(${EXEC1_NAME} app/pt_renderer.cu)
