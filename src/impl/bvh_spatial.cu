@@ -799,6 +799,7 @@ static int recursive_sbvh_SAH(
     // multi-threading primitives
     std::vector<SBVHBuilderThread> parallel_threads(number_of_workers - 1);
     static_assert(std::atomic<SBVHBuilderTaskKey>::is_always_lock_free);
+    // estimate task_queue capacity to be the total primitive count
     atomic_queue::AtomicQueueB<SBVHBuilderTaskKey> task_queue(cur_node->size());
     std::atomic_int queued_task_count{0};
 
@@ -847,10 +848,10 @@ static int recursive_sbvh_SAH(
             // if not able to parallelize (thread_count == 1), turn the thread
             // into a task queue consumer for load balance
             if (!task.is_leaf()) {
-                auto child_tasks = task.get_child_tasks();
+                auto [lchild_task, rchild_task] = task.get_child_tasks();
                 queued_task_count.fetch_add(2, std::memory_order_release);
-                task_queue.push(child_tasks[0].get_key());
-                task_queue.push(child_tasks[1].get_key());
+                task_queue.push(lchild_task.get_key());
+                task_queue.push(rchild_task.get_key());
             }
 
             SBVHBuilderTaskKey consume_task_key;
@@ -876,11 +877,12 @@ static int recursive_sbvh_SAH(
                         queued_task_count.fetch_sub(1,
                                                     std::memory_order_release);
                     } else {
-                        auto child_tasks = consume_task.get_child_tasks();
+                        auto [lchild_task, rchild_task] =
+                            consume_task.get_child_tasks();
                         queued_task_count.fetch_add(1,
                                                     std::memory_order_release);
-                        task_queue.push(child_tasks[0].get_key());
-                        task_queue.push(child_tasks[1].get_key());
+                        task_queue.push(lchild_task.get_key());
+                        task_queue.push(rchild_task.get_key());
                     }
                 }
             }
