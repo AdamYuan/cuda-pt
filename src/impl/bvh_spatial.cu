@@ -26,7 +26,6 @@
 #include "core/stats.h"
 #include <algorithm>
 #include <cassert>
-#include <cinttypes>
 #include <numeric>
 #include <optional>
 
@@ -118,6 +117,7 @@ class SBVHBuilderThread {
 };
 
 struct SBVHBuilderThreadID {
+    // `local` means the index in a SBVHBuilderThreadSpan
     int global, local;
 };
 
@@ -162,13 +162,14 @@ class SBVHBuilderThreadSpan {
                                       rchild_thread_cnt}};
     }
 
-    int get_thread_count() const { return thread_count; }
     bool should_queued() const { return thread_count == 0; }
     bool can_parallelize() const { return thread_count > 1; }
+    int get_parallelism() const { return thread_count; }
     SBVHBuilderThreadID get_thread_id(int thd_ofst = 0) const {
         return {.global = thread_base + thd_ofst, .local = thd_ofst};
     }
 
+    // run_... functions must be called on the first thread of a span
     template <typename Mapper_T, typename Reducer_T>
     void run_parallel_for(int size, Mapper_T &&mapper,
                           Reducer_T &&reducer) const {
@@ -198,10 +199,10 @@ class SBVHBuilderThreadSpan {
             reducer(thd_id);
         }
     }
-
     template <typename Func_T, typename Result_T = std::result_of_t<Func_T()>>
     std::future<Result_T> run_async(Func_T &&func) const {
         // assert(get_thread_id().global != 0)
+        // must not be called on the global first thread
         return parallel_threads[get_thread_id().global - 1].push(func);
     }
 };
@@ -344,7 +345,7 @@ void SpatialSplitter<N>::update_bins(const std::vector<Vec3> &points1,
     // the following can be made faster by partitioning and multi-threading
     if (threads.can_parallelize()) {
         // multi-thread implementation
-        std::vector<ChoppedBinningData> all_data(threads.get_thread_count());
+        std::vector<ChoppedBinningData> all_data(threads.get_parallelism());
 
         ChoppedBinningData result;
         size_t clip_aabb_size = 0;
@@ -780,7 +781,7 @@ static int recursive_sbvh_SAH(
         task_queue_producer_tokens.emplace_back(task_queue);
         task_queue_consumer_tokens.emplace_back(task_queue);
     }
-    std::atomic_uint32_t queued_task_count{0};
+    std::atomic_int queued_task_count{0};
 
     const auto parallel_sbvh_SAH_impl =
         [&recursive_sbvh_SAH_impl, &task_queue, &task_queue_producer_tokens,
