@@ -189,7 +189,7 @@ void SpatialSplitter<N>::update_bins(const std::vector<Vec3> &points1,
                                      /* possibly, add sphere flag later */
                                      const SBVHNode *const cur_node) {
     // the following can be made faster by partitioning and multi-threading
-    if (cur_node->size() > workload_threshold) {
+    if (false && cur_node->size() > workload_threshold) {
         // multi-thread implementation
         std::array<ChoppedBinningData, number_of_workers> all_data;
 
@@ -458,7 +458,7 @@ struct SBVHBuilderThreadID {
 
 // A span of threads that can be used for task execution
 class SBVHBuilderThreadSpan {
-  private:
+  public:
     // parallel threads indexed as 1, 2, ..., parallel_threads.size(),
     // the main thread is indexed as 0.
     // [parallel_threads.size() + 1] worker threads totally
@@ -765,11 +765,26 @@ static int recursive_sbvh_SAH(
     std::atomic_uint32_t queued_task_count{0};
 
     const auto recursive_sbvh_SAH_impl =
-        [&task_queue, &task_queue_producer_tokens, &task_queue_consumer_tokens,
-         &queued_task_count, &points1, &points2, &points3, &bvh_infos,
-         root_area, max_prim_node, ref_unsplit](
+        [&points1, &points2, &points3, &bvh_infos, root_area, max_prim_node,
+         ref_unsplit](const SBVHBuilderThreadSpan &threads,
+                      const SBVHBuilderTask &task,
+                      auto &&recursive_sbvh_SAH_impl) -> void {
+        node_sbvh_SAH(points1, points2, points3, bvh_infos, threads, task,
+                      root_area, max_prim_node, ref_unsplit);
+        if (task.is_leaf())
+            return;
+
+        auto [lchild_task, rchild_task] = task.get_child_tasks();
+        recursive_sbvh_SAH_impl(threads, lchild_task, recursive_sbvh_SAH_impl);
+        recursive_sbvh_SAH_impl(threads, rchild_task, recursive_sbvh_SAH_impl);
+    };
+
+    const auto parallel_sbvh_SAH_impl =
+        [&recursive_sbvh_SAH_impl, &task_queue, &task_queue_producer_tokens,
+         &task_queue_consumer_tokens, &queued_task_count, &points1, &points2,
+         &points3, &bvh_infos, root_area, max_prim_node, ref_unsplit](
             const SBVHBuilderThreadSpan &threads, const SBVHBuilderTask &task,
-            auto &&recursive_sbvh_SAH_impl) -> void {
+            auto &&parallel_sbvh_SAH_impl) -> void {
         node_sbvh_SAH(points1, points2, points3, bvh_infos, threads, task,
                       root_area, max_prim_node, ref_unsplit);
 
@@ -787,16 +802,20 @@ static int recursive_sbvh_SAH(
             if (lchild_threads.should_queued()) {
                 queued_task_count.fetch_add(1, std::memory_order_release);
                 task_queue.enqueue(task_queue_producer_token, lchild_task);
+                parallel_sbvh_SAH_impl(rchild_threads, rchild_task,
+                                       parallel_sbvh_SAH_impl);
             } else if (rchild_threads.should_queued()) {
                 queued_task_count.fetch_add(1, std::memory_order_release);
                 task_queue.enqueue(task_queue_producer_token, rchild_task);
+                parallel_sbvh_SAH_impl(lchild_threads, lchild_task,
+                                       parallel_sbvh_SAH_impl);
             } else {
                 std::future<void> rchild_future = rchild_threads.run_async([&] {
-                    recursive_sbvh_SAH_impl(rchild_threads, rchild_task,
-                                            recursive_sbvh_SAH_impl);
+                    parallel_sbvh_SAH_impl(rchild_threads, rchild_task,
+                                           parallel_sbvh_SAH_impl);
                 });
-                recursive_sbvh_SAH_impl(lchild_threads, lchild_task,
-                                        recursive_sbvh_SAH_impl);
+                parallel_sbvh_SAH_impl(lchild_threads, lchild_task,
+                                       parallel_sbvh_SAH_impl);
                 rchild_future.wait();
             }
         } else {
@@ -816,17 +835,16 @@ static int recursive_sbvh_SAH(
                     continue;
 
                 if (consume_task.cur_node->prim_num() < workload_threshold) {
-
                     recursive_sbvh_SAH_impl(threads, consume_task,
                                             recursive_sbvh_SAH_impl);
-                    queued_task_count.fetch_add(-1, std::memory_order_release);
+                    queued_task_count.fetch_sub(1, std::memory_order_release);
                 } else {
                     node_sbvh_SAH(points1, points2, points3, bvh_infos, threads,
                                   consume_task, root_area, max_prim_node,
                                   ref_unsplit);
 
                     if (consume_task.is_leaf()) {
-                        queued_task_count.fetch_add(-1,
+                        queued_task_count.fetch_sub(1,
                                                     std::memory_order_release);
                     } else {
                         auto child_tasks = consume_task.get_child_tasks();
@@ -840,8 +858,8 @@ static int recursive_sbvh_SAH(
         }
     };
 
-    recursive_sbvh_SAH_impl(SBVHBuilderThreadSpan{parallel_threads}, cur_task,
-                            recursive_sbvh_SAH_impl);
+    parallel_sbvh_SAH_impl(SBVHBuilderThreadSpan{parallel_threads}, cur_task,
+                           parallel_sbvh_SAH_impl);
 
     int node_num = 0;
     const auto iterate_sbvh_impl =
