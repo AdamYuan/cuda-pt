@@ -26,10 +26,12 @@
 #include "core/stats.h"
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <numeric>
 #include <optional>
 
 #include <atomic>
+#include <atomic_queue/atomic_queue.h>
 #include <concurrentqueue.h>
 #include <condition_variable>
 #include <future>
@@ -62,6 +64,7 @@ static constexpr int number_of_workers = 1;
 #endif // OPENMP_ENABLED
 static int max_depth = 0;
 
+using SBVHBuilderTaskKey = uint64_t;
 // Wrapping building of a SBVH Node as a Task for queuing
 struct SBVHBuilderTask {
     SBVHNode *cur_node;
@@ -72,6 +75,17 @@ struct SBVHBuilderTask {
                 SBVHBuilderTask{cur_node->rchild, depth + 1}};
     }
     bool is_leaf() const { return !cur_node->non_leaf(); }
+
+    SBVHBuilderTaskKey get_key() const {
+        static_assert(max_allowed_depth < 256);
+        static_assert(std::is_same_v<uint64_t, SBVHBuilderTaskKey>);
+        static_assert(sizeof(SBVHNode *) <= 8);
+        return uint64_t(uintptr_t(cur_node)) | uint64_t(depth) << 56ULL;
+    }
+    static SBVHBuilderTask from_key(SBVHBuilderTaskKey key) {
+        return {.cur_node = (SBVHNode *)uintptr_t(key & 0x00FFFFFFFFFFFFFFULL),
+                .depth = int(key >> 56ULL)};
+    }
 };
 
 // A simple thread pool with 1 thread and 1 task
@@ -784,30 +798,18 @@ static int recursive_sbvh_SAH(
 
     // multi-threading primitives
     std::vector<SBVHBuilderThread> parallel_threads(number_of_workers - 1);
-    moodycamel::ConcurrentQueue<SBVHBuilderTask> task_queue;
-    std::vector<moodycamel::ProducerToken> task_queue_producer_tokens;
-    std::vector<moodycamel::ConsumerToken> task_queue_consumer_tokens;
-    for (int i = 0; i < number_of_workers; ++i) {
-        task_queue_producer_tokens.emplace_back(task_queue);
-        task_queue_consumer_tokens.emplace_back(task_queue);
-    }
+    static_assert(std::atomic<SBVHBuilderTaskKey>::is_always_lock_free);
+    atomic_queue::AtomicQueueB<SBVHBuilderTaskKey> task_queue(cur_node->size());
     std::atomic_int queued_task_count{0};
 
     // a multi-threaded sbvh build function
     const auto parallel_sbvh_SAH_impl =
-        [&recursive_sbvh_SAH_impl, &task_queue, &task_queue_producer_tokens,
-         &task_queue_consumer_tokens, &queued_task_count, &points1, &points2,
-         &points3, &bvh_infos, root_area, max_prim_node, ref_unsplit](
+        [&recursive_sbvh_SAH_impl, &task_queue, &queued_task_count, &points1,
+         &points2, &points3, &bvh_infos, root_area, max_prim_node, ref_unsplit](
             const SBVHBuilderThreadSpan &threads, const SBVHBuilderTask &task,
             auto &&parallel_sbvh_SAH_impl) -> void {
         node_sbvh_SAH(points1, points2, points3, bvh_infos, threads, task,
                       root_area, max_prim_node, ref_unsplit);
-
-        // Fetch task queue tokens for the thread
-        auto &task_queue_producer_token =
-            task_queue_producer_tokens[threads.get_thread_id().global];
-        auto &task_queue_consumer_token =
-            task_queue_consumer_tokens[threads.get_thread_id().global];
 
         if (threads.can_parallelize()) {
             // if can parallelize (thread_count > 1), check the left and right
@@ -824,12 +826,12 @@ static int recursive_sbvh_SAH(
             // (thread_count == 0). otherwise run the tasks in parallel.
             if (lchild_threads.should_queued()) {
                 queued_task_count.fetch_add(1, std::memory_order_release);
-                task_queue.enqueue(task_queue_producer_token, lchild_task);
+                task_queue.push(lchild_task.get_key());
                 parallel_sbvh_SAH_impl(rchild_threads, rchild_task,
                                        parallel_sbvh_SAH_impl);
             } else if (rchild_threads.should_queued()) {
                 queued_task_count.fetch_add(1, std::memory_order_release);
-                task_queue.enqueue(task_queue_producer_token, rchild_task);
+                task_queue.push(rchild_task.get_key());
                 parallel_sbvh_SAH_impl(lchild_threads, lchild_task,
                                        parallel_sbvh_SAH_impl);
             } else {
@@ -847,18 +849,19 @@ static int recursive_sbvh_SAH(
             if (!task.is_leaf()) {
                 auto child_tasks = task.get_child_tasks();
                 queued_task_count.fetch_add(2, std::memory_order_release);
-                task_queue.enqueue_bulk(task_queue_producer_token,
-                                        child_tasks.begin(), 2);
+                task_queue.push(child_tasks[0].get_key());
+                task_queue.push(child_tasks[1].get_key());
             }
 
+            SBVHBuilderTaskKey consume_task_key;
             SBVHBuilderTask consume_task;
             // https://github.com/cameron314/concurrentqueue/blob/master/samples.md
             // refer to "Multithreaded game loop"
             while (queued_task_count.load(std::memory_order_acquire) != 0) {
-                if (!task_queue.try_dequeue(task_queue_consumer_token,
-                                            consume_task))
+                if (!task_queue.try_pop(consume_task_key))
                     continue;
 
+                consume_task = SBVHBuilderTask::from_key(consume_task_key);
                 if (consume_task.cur_node->prim_num() <
                     queue_workload_threshold) {
                     recursive_sbvh_SAH_impl(threads, consume_task,
@@ -876,8 +879,8 @@ static int recursive_sbvh_SAH(
                         auto child_tasks = consume_task.get_child_tasks();
                         queued_task_count.fetch_add(1,
                                                     std::memory_order_release);
-                        task_queue.enqueue_bulk(task_queue_producer_token,
-                                                child_tasks.begin(), 2);
+                        task_queue.push(child_tasks[0].get_key());
+                        task_queue.push(child_tasks[1].get_key());
                     }
                 }
             }
