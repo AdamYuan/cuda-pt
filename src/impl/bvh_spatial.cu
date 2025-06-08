@@ -32,7 +32,6 @@
 
 #include <atomic>
 #include <atomic_queue/atomic_queue.h>
-#include <concurrentqueue.h>
 #include <condition_variable>
 #include <future>
 #include <mutex>
