@@ -50,9 +50,164 @@ static constexpr float spatial_traverse_cost = 0.21f;
 static constexpr int max_allowed_depth = 96;
 // when number of triangles to process is greater than the following,
 // `update_bin` will employ thread pool to accelerate binning
-static constexpr int workload_threshold = 128;
+static constexpr int workload_threshold = 512;
 static constexpr int number_of_workers = 8;
 static int max_depth = 0;
+
+// Wrapping building of a SBVH Node as a Task for queuing
+struct SBVHBuilderTask {
+    SBVHNode *cur_node;
+    int depth;
+
+    std::array<SBVHBuilderTask, 2> get_child_tasks() const {
+        return {SBVHBuilderTask{cur_node->lchild, depth + 1},
+                SBVHBuilderTask{cur_node->rchild, depth + 1}};
+    }
+    bool is_leaf() const { return !cur_node->non_leaf(); }
+};
+
+// A simple thread pool with 1 thread and 1 task
+class SBVHBuilderThread {
+  private:
+    mutable std::optional<std::function<void()>> task;
+    mutable std::condition_variable cv;
+    mutable std::mutex mutex;
+    mutable std::thread thread;
+    mutable bool run_flag;
+
+    void worker_func() {
+        for (std::function<void()> cur_task;;) {
+            {
+                std::unique_lock lock{mutex};
+                cv.wait(lock, [this] { return task.has_value() || !run_flag; });
+                if (!run_flag && !task.has_value())
+                    return;
+                cur_task = std::move(task.value());
+                task.reset();
+            }
+            cur_task();
+        }
+    }
+
+  public:
+    SBVHBuilderThread() : run_flag{true} {
+        thread = std::thread(&SBVHBuilderThread::worker_func, this);
+    }
+    ~SBVHBuilderThread() {
+        {
+            std::scoped_lock lock{mutex};
+            run_flag = false;
+        }
+        cv.notify_one();
+        thread.join();
+    }
+    template <typename Func_T, typename... Arg_Ts,
+              typename Result_T = std::result_of_t<Func_T(Arg_Ts...)>>
+    std::future<Result_T> push(Func_T &&func, Arg_Ts &&...args) const {
+        auto push_task =
+            std::make_shared<std::packaged_task<Result_T()>>(std::bind(
+                std::forward<Func_T>(func), std::forward<Arg_Ts>(args)...));
+        std::future<Result_T> future = push_task->get_future();
+        {
+            std::scoped_lock lock{mutex};
+            task = [push_task] { (*push_task)(); };
+        }
+        cv.notify_one();
+        return future;
+    }
+};
+
+struct SBVHBuilderThreadID {
+    int global, local;
+};
+
+// A span of threads that can be used for task execution
+class SBVHBuilderThreadSpan {
+  private:
+    // parallel threads indexed as 1, 2, ..., parallel_threads.size(),
+    // the main thread is indexed as 0.
+    // (parallel_threads.size() + 1) worker threads totally
+    const std::vector<SBVHBuilderThread> &parallel_threads;
+
+    // defining the span of threads in range 0, 1, ..., parallel_threads.size()
+    int thread_base, thread_count;
+
+  public:
+    explicit SBVHBuilderThreadSpan(
+        const std::vector<SBVHBuilderThread> &parallel_threads)
+        : parallel_threads{parallel_threads}, thread_base{0},
+          thread_count((int)parallel_threads.size() + 1) {}
+    SBVHBuilderThreadSpan(
+        const std::vector<SBVHBuilderThread> &parallel_threads, int thread_base,
+        int thread_count)
+        : parallel_threads{parallel_threads}, thread_base{thread_base},
+          thread_count{thread_count} {}
+
+    std::array<SBVHBuilderThreadSpan, 2>
+    get_child_spans(const SBVHBuilderTask &lchild_task,
+                    const SBVHBuilderTask &rchild_task) const {
+        if (thread_count == 0)
+            return {SBVHBuilderThreadSpan{parallel_threads, thread_base, 0},
+                    SBVHBuilderThreadSpan{parallel_threads, thread_base, 0}};
+
+        int lchild_prim_cnt = lchild_task.cur_node->prims.size();
+        int rchild_prim_cnt = rchild_task.cur_node->prims.size();
+
+        int lchild_thread_cnt = std::clamp(
+            int(std::round(float(lchild_prim_cnt * thread_count) /
+                           float(lchild_prim_cnt + rchild_prim_cnt))),
+            0, thread_count);
+        int rchild_thread_cnt = thread_count - lchild_thread_cnt;
+        return {SBVHBuilderThreadSpan{parallel_threads, thread_base,
+                                      lchild_thread_cnt},
+                SBVHBuilderThreadSpan{parallel_threads,
+                                      thread_base + lchild_thread_cnt,
+                                      rchild_thread_cnt}};
+    }
+
+    int get_thread_count() const { return thread_count; }
+    bool should_queued() const { return thread_count == 0; }
+    bool can_parallelize() const { return thread_count > 1; }
+    SBVHBuilderThreadID get_thread_id(int thd_ofst = 0) const {
+        return {.global = thread_base + thd_ofst, .local = thd_ofst};
+    }
+
+    template <typename Mapper_T, typename Reducer_T>
+    void run_parallel_for(int size, Mapper_T &&mapper,
+                          Reducer_T &&reducer) const {
+        // assert can_parallelize()
+
+        int block_size = size / thread_count;
+        const auto func = [this, block_size, size,
+                           &mapper](SBVHBuilderThreadID thd_id) {
+            int begin = block_size * thd_id.local;
+            int end =
+                thd_id.local == thread_count - 1 ? size : begin + block_size;
+            for (int i = begin; i < end; ++i)
+                mapper(thd_id, i);
+        };
+
+        std::vector<std::future<void>> futures(thread_count - 1);
+        for (int thd_ofst = 1; thd_ofst < thread_count; ++thd_ofst) {
+            SBVHBuilderThreadID thd_id = get_thread_id(thd_ofst);
+            futures[thd_id.local - 1] =
+                parallel_threads[thd_id.global - 1].push(func, thd_id);
+        }
+        func(get_thread_id());
+        reducer(get_thread_id());
+        for (int thd_ofst = 1; thd_ofst < thread_count; ++thd_ofst) {
+            SBVHBuilderThreadID thd_id = get_thread_id(thd_ofst);
+            futures[thd_id.local - 1].wait();
+            reducer(thd_id);
+        }
+    }
+
+    template <typename Func_T, typename Result_T = std::result_of_t<Func_T()>>
+    std::future<Result_T> run_async(Func_T &&func) const {
+        // assert(get_thread_id().global != 0)
+        return parallel_threads[get_thread_id().global - 1].push(func);
+    }
+};
 
 SplitAxis SBVHNode::max_extent_axis(const std::vector<BVHInfo> &bvhs,
                                     float &min_r, float &interval) const {
@@ -187,41 +342,44 @@ void SpatialSplitter<N>::update_bins(const std::vector<Vec3> &points1,
                                      const std::vector<Vec3> &points2,
                                      const std::vector<Vec3> &points3,
                                      /* possibly, add sphere flag later */
+                                     const SBVHBuilderThreadSpan &threads,
                                      const SBVHNode *const cur_node) {
     // the following can be made faster by partitioning and multi-threading
-    if (false && cur_node->size() > workload_threshold) {
+    if (threads.can_parallelize()) {
         // multi-thread implementation
-        std::array<ChoppedBinningData, number_of_workers> all_data;
-
-#pragma omp parallel for num_threads(number_of_workers)
-        for (size_t i = 0; i < cur_node->size(); i++) {
-            int prim_id = cur_node->prims[i];
-            int thread_id = omp_get_thread_num();
-            ChoppedBinningData &local_data = all_data[thread_id];
-            update_triangle(
-                {points1[prim_id], points2[prim_id], points3[prim_id]},
-                local_data.bounds, local_data.enter_tris, local_data.exit_tris,
-                local_data.clip_poly_aabbs, prim_id);
-        }
+        std::vector<ChoppedBinningData> all_data(threads.get_thread_count());
 
         ChoppedBinningData result;
         size_t clip_aabb_size = 0;
-        for (ChoppedBinningData &local_data : all_data) {
-            for (int bin_id = 0; bin_id < N; bin_id++) {
-                result.bounds[bin_id] += local_data.bounds[bin_id];
-                result.enter_tris[bin_id].insert(
-                    result.enter_tris[bin_id].end(),
-                    local_data.enter_tris[bin_id].begin(),
-                    local_data.enter_tris[bin_id].end());
-                result.exit_tris[bin_id].insert(
-                    result.exit_tris[bin_id].end(),
-                    local_data.exit_tris[bin_id].begin(),
-                    local_data.exit_tris[bin_id].end());
-            }
-            if (employ_unsplit) {
-                clip_aabb_size += local_data.clip_poly_aabbs.size();
-            }
-        }
+
+        threads.run_parallel_for(
+            cur_node->size(),
+            [&](SBVHBuilderThreadID thread_id, int i) {
+                int prim_id = cur_node->prims[i];
+                ChoppedBinningData &local_data = all_data[thread_id.local];
+                update_triangle(
+                    {points1[prim_id], points2[prim_id], points3[prim_id]},
+                    local_data.bounds, local_data.enter_tris,
+                    local_data.exit_tris, local_data.clip_poly_aabbs, prim_id);
+            },
+            [&](SBVHBuilderThreadID thread_id) {
+                auto &local_data = all_data[thread_id.local];
+                for (int bin_id = 0; bin_id < N; bin_id++) {
+                    result.bounds[bin_id] += local_data.bounds[bin_id];
+                    result.enter_tris[bin_id].insert(
+                        result.enter_tris[bin_id].end(),
+                        local_data.enter_tris[bin_id].begin(),
+                        local_data.enter_tris[bin_id].end());
+                    result.exit_tris[bin_id].insert(
+                        result.exit_tris[bin_id].end(),
+                        local_data.exit_tris[bin_id].begin(),
+                        local_data.exit_tris[bin_id].end());
+                }
+                if (employ_unsplit) {
+                    clip_aabb_size += local_data.clip_poly_aabbs.size();
+                }
+            });
+
         if (clip_aabb_size > 0) {
             result.clip_poly_aabbs.reserve(clip_aabb_size);
             for (ChoppedBinningData &local_data : all_data) {
@@ -390,148 +548,6 @@ bool spatial_split_criteria(float root_area, float intrs_area, int num_prims) {
     return intrs_area > root_overlap_factor * root_area;
 }
 
-// A simple thread pool with 1 thread and 1 task
-class SBVHBuilderThread {
-  private:
-    mutable std::optional<std::function<void()>> task;
-    mutable std::condition_variable cv;
-    mutable std::mutex mutex;
-    mutable std::thread thread;
-    mutable bool run_flag;
-
-    void worker_func() {
-        for (std::function<void()> cur_task;;) {
-            {
-                std::unique_lock lock{mutex};
-                cv.wait(lock, [this] { return task.has_value() || !run_flag; });
-                if (!run_flag && !task.has_value())
-                    return;
-                cur_task = std::move(task.value());
-                task.reset();
-            }
-            cur_task();
-        }
-    }
-
-  public:
-    SBVHBuilderThread() : run_flag{true} {
-        thread = std::thread(&SBVHBuilderThread::worker_func, this);
-    }
-    ~SBVHBuilderThread() {
-        {
-            std::scoped_lock lock{mutex};
-            run_flag = false;
-        }
-        cv.notify_one();
-        thread.join();
-    }
-    template <typename Func_T, typename... Arg_Ts,
-              typename Result_T = std::result_of_t<Func_T(Arg_Ts...)>>
-    std::future<Result_T> push(Func_T &&func, Arg_Ts &&...args) const {
-        auto push_task =
-            std::make_shared<std::packaged_task<Result_T()>>(std::bind(
-                std::forward<Func_T>(func), std::forward<Arg_Ts>(args)...));
-        std::future<Result_T> future = push_task->get_future();
-        {
-            std::scoped_lock lock{mutex};
-            task = [push_task] { (*push_task)(); };
-        }
-        cv.notify_one();
-        return future;
-    }
-};
-
-struct SBVHBuilderTask {
-    SBVHNode *cur_node;
-    int depth;
-
-    std::array<SBVHBuilderTask, 2> get_child_tasks() const {
-        return {SBVHBuilderTask{cur_node->lchild, depth + 1},
-                SBVHBuilderTask{cur_node->rchild, depth + 1}};
-    }
-    bool is_leaf() const { return !cur_node->non_leaf(); }
-};
-
-struct SBVHBuilderThreadID {
-    int global, task_local;
-};
-
-// A span of threads that can be used for task execution
-class SBVHBuilderThreadSpan {
-  public:
-    // parallel threads indexed as 1, 2, ..., parallel_threads.size(),
-    // the main thread is indexed as 0.
-    // [parallel_threads.size() + 1] worker threads totally
-    const std::vector<SBVHBuilderThread> &parallel_threads;
-
-    // defining the span of threads in range 0, 1, ..., parallel_threads.size()
-    int thread_base, thread_count;
-
-  public:
-    SBVHBuilderThreadSpan(
-        const std::vector<SBVHBuilderThread> &parallel_threads)
-        : parallel_threads{parallel_threads}, thread_base{0},
-          thread_count(parallel_threads.size() + 1) {}
-    SBVHBuilderThreadSpan(
-        const std::vector<SBVHBuilderThread> &parallel_threads, int thread_base,
-        int thread_count)
-        : parallel_threads{parallel_threads}, thread_base{thread_base},
-          thread_count{thread_count} {}
-
-    std::array<SBVHBuilderThreadSpan, 2>
-    get_child_spans(const SBVHBuilderTask &lchild_task,
-                    const SBVHBuilderTask &rchild_task) const {
-        if (thread_count == 0)
-            return {SBVHBuilderThreadSpan{parallel_threads, thread_base, 0},
-                    SBVHBuilderThreadSpan{parallel_threads, thread_base, 0}};
-
-        int lchild_prim_cnt = lchild_task.cur_node->prims.size();
-        int rchild_prim_cnt = rchild_task.cur_node->prims.size();
-
-        int lchild_thread_cnt = std::clamp(
-            int(std::round(float(lchild_prim_cnt * thread_count) /
-                           float(lchild_prim_cnt + rchild_prim_cnt))),
-            0, thread_count);
-        int rchild_thread_cnt = thread_count - lchild_thread_cnt;
-        return {SBVHBuilderThreadSpan{parallel_threads, thread_base,
-                                      lchild_thread_cnt},
-                SBVHBuilderThreadSpan{parallel_threads,
-                                      thread_base + lchild_thread_cnt,
-                                      rchild_thread_cnt}};
-    }
-
-    bool should_queued() const { return thread_count == 0; }
-    bool can_parallelize() const { return thread_count > 1; }
-    SBVHBuilderThreadID get_thread_id(int thd_ofst = 0) const {
-        return {.global = thread_base + thd_ofst, .task_local = thd_ofst};
-    }
-
-    template <
-        typename Mapper_T, typename Reducer_T,
-        typename Result_T = std::result_of_t<Mapper_T(SBVHBuilderThreadID)>>
-    Result_T run_parallel(Mapper_T &&mapper, Reducer_T &&reducer) const {
-        // assert(get_thread_id().global != 0)
-        // assert(can_parallelize())
-        std::vector<std::future<Result_T>> futures(thread_count - 1);
-        for (int thd_ofst = 1; thd_ofst < thread_count; ++thd_ofst) {
-            SBVHBuilderThreadID thd_id = get_thread_id(thd_ofst);
-            futures[thd_id.task_local - 1] =
-                parallel_threads[thd_id.global - 1].push(mapper, thd_id);
-        }
-        Result_T result = mapper(get_thread_id());
-        for (std::future<Result_T> &future : futures) {
-            reducer(result, future.get());
-        }
-        return result;
-    }
-
-    template <typename Func_T, typename Result_T = std::result_of_t<Func_T()>>
-    std::future<Result_T> run_async(Func_T &&func) const {
-        // assert(get_thread_id().global != 0)
-        return parallel_threads[get_thread_id().global - 1].push(func);
-    }
-};
-
 // TODO(heqianyue): note that we currently don't support
 // sphere primitive. Support it would be straightforward:
 // overload the 'update' function for spheres
@@ -633,7 +649,7 @@ void node_sbvh_SAH(const std::vector<Vec3> &points1,
                 root_area, fwd_bound.intersection_area(bwd_bound), prim_num)) {
             SpatialSplitter<num_sbins> ssp(cur_node->bound, max_axis,
                                            ref_unsplit);
-            ssp.update_bins(points1, points2, points3, cur_node);
+            ssp.update_bins(points1, points2, points3, threads, cur_node);
 
             int sbvh_seg_idx = 0;
             float sbvh_cost = ssp.eval_spatial_split(
@@ -730,16 +746,6 @@ void node_sbvh_SAH(const std::vector<Vec3> &points1,
         cur_node->rchild =
             new SBVHNode(std::move(bwd_bound), std::move(rchild_idxs));
         cur_node->axis = max_axis;
-
-        /* int node_num = 1;
-        node_num +=
-            recursive_sbvh_SAH(points1, points2, points3, bvh_infos,
-                                ,
-                               root_area, max_prim_node, ref_unsplit);
-
-            recursive_sbvh_SAH(points1, points2, points3, bvh_infos,
-                                ,
-                               root_area, max_prim_node, ref_unsplit); */
     } else {
         return process_leaf();
     }
@@ -752,17 +758,6 @@ static int recursive_sbvh_SAH(
     float root_area, int max_prim_node = 16, bool ref_unsplit = true) {
 
     auto cur_task = SBVHBuilderTask{cur_node, depth};
-
-    std::vector<SBVHBuilderThread> parallel_threads(number_of_workers - 1);
-
-    moodycamel::ConcurrentQueue<SBVHBuilderTask> task_queue;
-    std::vector<moodycamel::ProducerToken> task_queue_producer_tokens;
-    std::vector<moodycamel::ConsumerToken> task_queue_consumer_tokens;
-    for (int i = 0; i < number_of_workers; ++i) {
-        task_queue_producer_tokens.emplace_back(task_queue);
-        task_queue_consumer_tokens.emplace_back(task_queue);
-    }
-    std::atomic_uint32_t queued_task_count{0};
 
     const auto recursive_sbvh_SAH_impl =
         [&points1, &points2, &points3, &bvh_infos, root_area, max_prim_node,
@@ -779,6 +774,16 @@ static int recursive_sbvh_SAH(
         recursive_sbvh_SAH_impl(threads, rchild_task, recursive_sbvh_SAH_impl);
     };
 
+    std::vector<SBVHBuilderThread> parallel_threads(number_of_workers - 1);
+    moodycamel::ConcurrentQueue<SBVHBuilderTask> task_queue;
+    std::vector<moodycamel::ProducerToken> task_queue_producer_tokens;
+    std::vector<moodycamel::ConsumerToken> task_queue_consumer_tokens;
+    for (int i = 0; i < number_of_workers; ++i) {
+        task_queue_producer_tokens.emplace_back(task_queue);
+        task_queue_consumer_tokens.emplace_back(task_queue);
+    }
+    std::atomic_uint32_t queued_task_count{0};
+
     const auto parallel_sbvh_SAH_impl =
         [&recursive_sbvh_SAH_impl, &task_queue, &task_queue_producer_tokens,
          &task_queue_consumer_tokens, &queued_task_count, &points1, &points2,
@@ -788,6 +793,7 @@ static int recursive_sbvh_SAH(
         node_sbvh_SAH(points1, points2, points3, bvh_infos, threads, task,
                       root_area, max_prim_node, ref_unsplit);
 
+        // Fetch task queue tokens for the thread
         auto &task_queue_producer_token =
             task_queue_producer_tokens[threads.get_thread_id().global];
         auto &task_queue_consumer_token =
@@ -796,9 +802,12 @@ static int recursive_sbvh_SAH(
         if (threads.can_parallelize()) {
             if (task.is_leaf())
                 return;
+
+            // Get child tasks and thread spans
             auto [lchild_task, rchild_task] = task.get_child_tasks();
             auto [lchild_threads, rchild_threads] =
                 threads.get_child_spans(lchild_task, rchild_task);
+
             if (lchild_threads.should_queued()) {
                 queued_task_count.fetch_add(1, std::memory_order_release);
                 task_queue.enqueue(task_queue_producer_token, lchild_task);
@@ -861,6 +870,8 @@ static int recursive_sbvh_SAH(
     parallel_sbvh_SAH_impl(SBVHBuilderThreadSpan{parallel_threads}, cur_task,
                            parallel_sbvh_SAH_impl);
 
+    // Traverse SBVH single-threaded to flatten leaf primitives,
+    // update max_depth and node_num
     int node_num = 0;
     const auto iterate_sbvh_impl =
         [&node_num, &flattened_idxs](const SBVHBuilderTask &task,
