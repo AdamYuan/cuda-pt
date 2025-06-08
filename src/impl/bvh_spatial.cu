@@ -123,7 +123,7 @@ class SBVHBuilderThread {
         thread.join();
     }
     template <typename Func_T, typename... Arg_Ts,
-              typename Result_T = std::result_of_t<Func_T(Arg_Ts...)>>
+              typename Result_T = std::invoke_result_t<Func_T, Arg_Ts...>>
     std::future<Result_T> push(Func_T &&func, Arg_Ts &&...args) const {
         auto push_task =
             std::make_shared<std::packaged_task<Result_T()>>(std::bind(
@@ -221,7 +221,7 @@ class SBVHBuilderThreadSpan {
             reducer(thd_id);
         }
     }
-    template <typename Func_T, typename Result_T = std::result_of_t<Func_T()>>
+    template <typename Func_T, typename Result_T = std::invoke_result_t<Func_T>>
     std::future<Result_T> run_async(Func_T &&func) const {
         // assert(get_thread_id().global != 0)
         // must not be called on the global first thread
