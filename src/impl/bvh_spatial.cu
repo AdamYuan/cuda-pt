@@ -757,6 +757,7 @@ static int recursive_sbvh_SAH(
 
     auto cur_task = SBVHBuilderTask{cur_node, depth};
 
+    // a single-threaded sbvh build function
     const auto recursive_sbvh_SAH_impl =
         [&points1, &points2, &points3, &bvh_infos, root_area, max_prim_node,
          ref_unsplit](const SBVHBuilderThreadSpan &threads,
@@ -772,7 +773,7 @@ static int recursive_sbvh_SAH(
         recursive_sbvh_SAH_impl(threads, rchild_task, recursive_sbvh_SAH_impl);
     };
 
-    // threading primitives
+    // multi-threading primitives
     std::vector<SBVHBuilderThread> parallel_threads(number_of_workers - 1);
     moodycamel::ConcurrentQueue<SBVHBuilderTask> task_queue;
     std::vector<moodycamel::ProducerToken> task_queue_producer_tokens;
@@ -783,6 +784,7 @@ static int recursive_sbvh_SAH(
     }
     std::atomic_int queued_task_count{0};
 
+    // a multi-threaded sbvh build function
     const auto parallel_sbvh_SAH_impl =
         [&recursive_sbvh_SAH_impl, &task_queue, &task_queue_producer_tokens,
          &task_queue_consumer_tokens, &queued_task_count, &points1, &points2,
@@ -799,6 +801,8 @@ static int recursive_sbvh_SAH(
             task_queue_consumer_tokens[threads.get_thread_id().global];
 
         if (threads.can_parallelize()) {
+            // if can parallelize (thread_count > 1), check the left and right
+            // thread spans and run in parallel if necessary.
             if (task.is_leaf())
                 return;
 
@@ -807,6 +811,8 @@ static int recursive_sbvh_SAH(
             auto [lchild_threads, rchild_threads] =
                 threads.get_child_spans(lchild_task, rchild_task);
 
+            // queue left or right tasks if their thread span is too small
+            // (thread_count == 0). otherwise run the tasks in parallel.
             if (lchild_threads.should_queued()) {
                 queued_task_count.fetch_add(1, std::memory_order_release);
                 task_queue.enqueue(task_queue_producer_token, lchild_task);
@@ -827,6 +833,8 @@ static int recursive_sbvh_SAH(
                 rchild_future.wait();
             }
         } else {
+            // if not able to parallelize (thread_count == 1), turn the thread
+            // into a task queue consumer for load balance
             if (!task.is_leaf()) {
                 auto child_tasks = task.get_child_tasks();
                 queued_task_count.fetch_add(2, std::memory_order_release);
@@ -869,8 +877,8 @@ static int recursive_sbvh_SAH(
     parallel_sbvh_SAH_impl(SBVHBuilderThreadSpan{parallel_threads}, cur_task,
                            parallel_sbvh_SAH_impl);
 
-    // Traverse SBVH single-threaded to flatten leaf primitives,
-    // update max_depth and node_num
+    // traverse SBVH single-threaded to flatten leaf primitives,
+    // also update max_depth and node_num
     int node_num = 0;
     const auto iterate_sbvh_impl =
         [&node_num, &flattened_idxs](const SBVHBuilderTask &task,
