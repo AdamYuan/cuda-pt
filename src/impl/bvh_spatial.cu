@@ -456,9 +456,15 @@ struct SBVHBuilderThreadID {
     int global, task_local;
 };
 
+// A span of threads that can be used for task execution
 class SBVHBuilderThreadSpan {
   private:
+    // parallel threads indexed as 1, 2, ..., parallel_threads.size(),
+    // the main thread is indexed as 0.
+    // [parallel_threads.size() + 1] worker threads totally
     const std::vector<SBVHBuilderThread> &parallel_threads;
+
+    // defining the span of threads in range 0, 1, ..., parallel_threads.size()
     int thread_base, thread_count;
 
   public:
@@ -500,25 +506,27 @@ class SBVHBuilderThreadSpan {
         return {.global = thread_base + thd_ofst, .task_local = thd_ofst};
     }
 
-    template <typename Mapper_T, typename Reducer_T>
-    void run_parallel(Mapper_T &&mapper, Reducer_T &&reducer) const {
-        // assert can_parallelize()
-        using R = std::result_of_t<Mapper_T(SBVHBuilderThreadID)>;
-        std::vector<std::future<R>> futures(thread_count - 1);
+    template <
+        typename Mapper_T, typename Reducer_T,
+        typename Result_T = std::result_of_t<Mapper_T(SBVHBuilderThreadID)>>
+    Result_T run_parallel(Mapper_T &&mapper, Reducer_T &&reducer) const {
+        // assert(get_thread_id().global != 0)
+        // assert(can_parallelize())
+        std::vector<std::future<Result_T>> futures(thread_count - 1);
         for (int thd_ofst = 1; thd_ofst < thread_count; ++thd_ofst) {
             SBVHBuilderThreadID thd_id = get_thread_id(thd_ofst);
             futures[thd_id.task_local - 1] =
                 parallel_threads[thd_id.global - 1].push(mapper, thd_id);
         }
-        reducer(get_thread_id(), mapper(get_thread_id()));
-        for (int thd_ofst = 1; thd_ofst < thread_count; ++thd_ofst) {
-            SBVHBuilderThreadID thd_id = get_thread_id(thd_ofst);
-            reducer(thd_id, futures[thd_id.task_local - 1].get());
+        Result_T result = mapper(get_thread_id());
+        for (std::future<Result_T> &future : futures) {
+            reducer(result, future.get());
         }
     }
 
     template <typename Func_T, typename Result_T = std::result_of_t<Func_T()>>
     std::future<Result_T> run_async(Func_T &&func) const {
+        // assert(get_thread_id().global != 0)
         return parallel_threads[get_thread_id().global - 1].push(func);
     }
 };
