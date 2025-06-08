@@ -26,7 +26,16 @@
 #include "core/stats.h"
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <numeric>
+#include <optional>
+
+#include <atomic>
+#include <concurrentqueue.h>
+#include <condition_variable>
+#include <future>
+#include <mutex>
+#include <thread>
 
 static constexpr int num_bins = 64;
 static constexpr int num_sbins = 128; // spatial bins
@@ -381,26 +390,157 @@ bool spatial_split_criteria(float root_area, float intrs_area, int num_prims) {
     return intrs_area > root_overlap_factor * root_area;
 }
 
+// A simple thread pool with 1 thread and 1 task
+class SBVHBuilderThread {
+  private:
+    mutable std::optional<std::function<void()>> task;
+    mutable std::condition_variable cv;
+    mutable std::mutex mutex;
+    mutable std::thread thread;
+    mutable bool run_flag;
+
+    void worker_func() {
+        for (std::function<void()> cur_task;;) {
+            {
+                std::unique_lock lock{mutex};
+                cv.wait(lock, [this] { return task.has_value() || !run_flag; });
+                if (!run_flag && !task.has_value())
+                    return;
+                cur_task = std::move(task.value());
+                task.reset();
+            }
+            cur_task();
+        }
+    }
+
+  public:
+    SBVHBuilderThread() : run_flag{true} {
+        thread = std::thread(&SBVHBuilderThread::worker_func, this);
+    }
+    ~SBVHBuilderThread() {
+        {
+            std::scoped_lock lock{mutex};
+            run_flag = false;
+        }
+        cv.notify_one();
+        thread.join();
+    }
+    template <typename Func_T, typename... Arg_Ts,
+              typename Result_T = std::result_of_t<Func_T(Arg_Ts...)>>
+    std::future<Result_T> push(Func_T &&func, Arg_Ts &&...args) const {
+        auto push_task =
+            std::make_shared<std::packaged_task<Result_T()>>(std::bind(
+                std::forward<Func_T>(func), std::forward<Arg_Ts>(args)...));
+        std::future<Result_T> future = push_task->get_future();
+        {
+            std::scoped_lock lock{mutex};
+            task = [push_task] { (*push_task)(); };
+        }
+        cv.notify_one();
+        return future;
+    }
+};
+
+struct SBVHBuilderTask {
+    SBVHNode *cur_node;
+    int depth;
+
+    std::array<SBVHBuilderTask, 2> get_child_tasks() const {
+        return {SBVHBuilderTask{cur_node->lchild, depth + 1},
+                SBVHBuilderTask{cur_node->rchild, depth + 1}};
+    }
+    bool is_leaf() const { return !cur_node->non_leaf(); }
+};
+
+struct SBVHBuilderThreadID {
+    int global, task_local;
+};
+
+class SBVHBuilderThreadSpan {
+  private:
+    const std::vector<SBVHBuilderThread> &parallel_threads;
+    int thread_base, thread_count;
+
+  public:
+    SBVHBuilderThreadSpan(
+        const std::vector<SBVHBuilderThread> &parallel_threads)
+        : parallel_threads{parallel_threads}, thread_base{0},
+          thread_count(parallel_threads.size() + 1) {}
+    SBVHBuilderThreadSpan(
+        const std::vector<SBVHBuilderThread> &parallel_threads, int thread_base,
+        int thread_count)
+        : parallel_threads{parallel_threads}, thread_base{thread_base},
+          thread_count{thread_count} {}
+
+    std::array<SBVHBuilderThreadSpan, 2>
+    get_child_spans(const SBVHBuilderTask &lchild_task,
+                    const SBVHBuilderTask &rchild_task) const {
+        if (thread_count == 0)
+            return {SBVHBuilderThreadSpan{parallel_threads, thread_base, 0},
+                    SBVHBuilderThreadSpan{parallel_threads, thread_base, 0}};
+
+        int lchild_prim_cnt = lchild_task.cur_node->prims.size();
+        int rchild_prim_cnt = rchild_task.cur_node->prims.size();
+
+        int lchild_thread_cnt = std::clamp(
+            int(std::round(float(lchild_prim_cnt * thread_count) /
+                           float(lchild_prim_cnt + rchild_prim_cnt))),
+            0, thread_count);
+        int rchild_thread_cnt = thread_count - lchild_thread_cnt;
+        return {SBVHBuilderThreadSpan{parallel_threads, thread_base,
+                                      lchild_thread_cnt},
+                SBVHBuilderThreadSpan{parallel_threads,
+                                      thread_base + lchild_thread_cnt,
+                                      rchild_thread_cnt}};
+    }
+
+    bool should_queued() const { return thread_count == 0; }
+    bool can_parallelize() const { return thread_count > 1; }
+    SBVHBuilderThreadID get_thread_id(int thd_ofst = 0) const {
+        return {.global = thread_base + thd_ofst, .task_local = thd_ofst};
+    }
+
+    template <typename Mapper_T, typename Reducer_T>
+    void run_parallel(Mapper_T &&mapper, Reducer_T &&reducer) const {
+        // assert can_parallelize()
+        using R = std::result_of_t<Mapper_T(SBVHBuilderThreadID)>;
+        std::vector<std::future<R>> futures(thread_count - 1);
+        for (int thd_ofst = 1; thd_ofst < thread_count; ++thd_ofst) {
+            SBVHBuilderThreadID thd_id = get_thread_id(thd_ofst);
+            futures[thd_id.task_local - 1] =
+                parallel_threads[thd_id.global - 1].push(mapper, thd_id);
+        }
+        reducer(get_thread_id(), mapper(get_thread_id()));
+        for (int thd_ofst = 1; thd_ofst < thread_count; ++thd_ofst) {
+            SBVHBuilderThreadID thd_id = get_thread_id(thd_ofst);
+            reducer(thd_id, futures[thd_id.task_local - 1].get());
+        }
+    }
+
+    template <typename Func_T, typename Result_T = std::result_of_t<Func_T()>>
+    std::future<Result_T> run_async(Func_T &&func) const {
+        return parallel_threads[get_thread_id().global - 1].push(func);
+    }
+};
+
 // TODO(heqianyue): note that we currently don't support
 // sphere primitive. Support it would be straightforward:
 // overload the 'update' function for spheres
-int recursive_sbvh_SAH(const std::vector<Vec3> &points1,
-                       const std::vector<Vec3> &points2,
-                       const std::vector<Vec3> &points3,
-                       const std::vector<BVHInfo> &bvh_infos,
-                       std::vector<int> &flattened_idxs,
-                       SBVHNode *const cur_node, int depth, float root_area,
-                       int max_prim_node = 16, bool ref_unsplit = true) {
+void node_sbvh_SAH(const std::vector<Vec3> &points1,
+                   const std::vector<Vec3> &points2,
+                   const std::vector<Vec3> &points3,
+                   const std::vector<BVHInfo> &bvh_infos,
+                   const SBVHBuilderThreadSpan &threads,
+                   const SBVHBuilderTask &task, float root_area,
+                   int max_prim_node = 16, bool ref_unsplit = true) {
+
+    auto cur_node = task.cur_node;
+    auto depth = task.depth;
+
     auto process_leaf = [&]() {
         // leaf node processing function
         cur_node->axis = AXIS_NONE;
-        cur_node->base() = static_cast<int>(flattened_idxs.size());
         cur_node->prim_num() = static_cast<int>(cur_node->size());
-        max_depth = std::max(max_depth, depth);
-        for (int prim_id : cur_node->prims) {
-            flattened_idxs.push_back(prim_id);
-        }
-        return 1;
     };
     float min_range = 0, interval = 0;
     // Step 1: decide the axis that expands the maximum extent of space
@@ -582,18 +722,138 @@ int recursive_sbvh_SAH(const std::vector<Vec3> &points1,
             new SBVHNode(std::move(bwd_bound), std::move(rchild_idxs));
         cur_node->axis = max_axis;
 
-        int node_num = 1;
-        node_num += recursive_sbvh_SAH(
-            points1, points2, points3, bvh_infos, flattened_idxs,
-            cur_node->lchild, depth + 1, root_area, max_prim_node, ref_unsplit);
+        /* int node_num = 1;
+        node_num +=
+            recursive_sbvh_SAH(points1, points2, points3, bvh_infos,
+                                ,
+                               root_area, max_prim_node, ref_unsplit);
 
-        node_num += recursive_sbvh_SAH(
-            points1, points2, points3, bvh_infos, flattened_idxs,
-            cur_node->rchild, depth + 1, root_area, max_prim_node, ref_unsplit);
-        return node_num;
+            recursive_sbvh_SAH(points1, points2, points3, bvh_infos,
+                                ,
+                               root_area, max_prim_node, ref_unsplit); */
     } else {
         return process_leaf();
     }
+}
+
+static int recursive_sbvh_SAH(
+    const std::vector<Vec3> &points1, const std::vector<Vec3> &points2,
+    const std::vector<Vec3> &points3, const std::vector<BVHInfo> &bvh_infos,
+    std::vector<int> &flattened_idxs, SBVHNode *const cur_node, int depth,
+    float root_area, int max_prim_node = 16, bool ref_unsplit = true) {
+
+    auto cur_task = SBVHBuilderTask{cur_node, depth};
+
+    std::vector<SBVHBuilderThread> parallel_threads(number_of_workers - 1);
+
+    moodycamel::ConcurrentQueue<SBVHBuilderTask> task_queue;
+    std::vector<moodycamel::ProducerToken> task_queue_producer_tokens;
+    std::vector<moodycamel::ConsumerToken> task_queue_consumer_tokens;
+    for (int i = 0; i < number_of_workers; ++i) {
+        task_queue_producer_tokens.emplace_back(task_queue);
+        task_queue_consumer_tokens.emplace_back(task_queue);
+    }
+    std::atomic_uint32_t queued_task_count{0};
+
+    const auto recursive_sbvh_SAH_impl =
+        [&task_queue, &task_queue_producer_tokens, &task_queue_consumer_tokens,
+         &queued_task_count, &points1, &points2, &points3, &bvh_infos,
+         root_area, max_prim_node, ref_unsplit](
+            const SBVHBuilderThreadSpan &threads, const SBVHBuilderTask &task,
+            auto &&recursive_sbvh_SAH_impl) -> void {
+        node_sbvh_SAH(points1, points2, points3, bvh_infos, threads, task,
+                      root_area, max_prim_node, ref_unsplit);
+
+        auto &task_queue_producer_token =
+            task_queue_producer_tokens[threads.get_thread_id().global];
+        auto &task_queue_consumer_token =
+            task_queue_consumer_tokens[threads.get_thread_id().global];
+
+        if (threads.can_parallelize()) {
+            if (task.is_leaf())
+                return;
+            auto [lchild_task, rchild_task] = task.get_child_tasks();
+            auto [lchild_threads, rchild_threads] =
+                threads.get_child_spans(lchild_task, rchild_task);
+            if (lchild_threads.should_queued()) {
+                queued_task_count.fetch_add(1, std::memory_order_release);
+                task_queue.enqueue(task_queue_producer_token, lchild_task);
+            } else if (rchild_threads.should_queued()) {
+                queued_task_count.fetch_add(1, std::memory_order_release);
+                task_queue.enqueue(task_queue_producer_token, rchild_task);
+            } else {
+                std::future<void> rchild_future = rchild_threads.run_async([&] {
+                    recursive_sbvh_SAH_impl(rchild_threads, rchild_task,
+                                            recursive_sbvh_SAH_impl);
+                });
+                recursive_sbvh_SAH_impl(lchild_threads, lchild_task,
+                                        recursive_sbvh_SAH_impl);
+                rchild_future.wait();
+            }
+        } else {
+            if (!task.is_leaf()) {
+                auto child_tasks = task.get_child_tasks();
+                queued_task_count.fetch_add(2, std::memory_order_release);
+                task_queue.enqueue_bulk(task_queue_producer_token,
+                                        child_tasks.begin(), 2);
+            }
+
+            SBVHBuilderTask consume_task;
+            // https://github.com/cameron314/concurrentqueue/blob/master/samples.md
+            // "Multithreaded game loop"
+            while (queued_task_count.load(std::memory_order_acquire) != 0) {
+                if (!task_queue.try_dequeue(task_queue_consumer_token,
+                                            consume_task))
+                    continue;
+
+                if (consume_task.cur_node->prim_num() < workload_threshold) {
+
+                    recursive_sbvh_SAH_impl(threads, consume_task,
+                                            recursive_sbvh_SAH_impl);
+                    queued_task_count.fetch_add(-1, std::memory_order_release);
+                } else {
+                    node_sbvh_SAH(points1, points2, points3, bvh_infos, threads,
+                                  consume_task, root_area, max_prim_node,
+                                  ref_unsplit);
+
+                    if (consume_task.is_leaf()) {
+                        queued_task_count.fetch_add(-1,
+                                                    std::memory_order_release);
+                    } else {
+                        auto child_tasks = consume_task.get_child_tasks();
+                        queued_task_count.fetch_add(1,
+                                                    std::memory_order_release);
+                        task_queue.enqueue_bulk(task_queue_producer_token,
+                                                child_tasks.begin(), 2);
+                    }
+                }
+            }
+        }
+    };
+
+    recursive_sbvh_SAH_impl(SBVHBuilderThreadSpan{parallel_threads}, cur_task,
+                            recursive_sbvh_SAH_impl);
+
+    int node_num = 0;
+    const auto iterate_sbvh_impl =
+        [&node_num, &flattened_idxs](const SBVHBuilderTask &task,
+                                     auto &&iterate_sbvh_impl) -> void {
+        ++node_num;
+        if (task.is_leaf()) {
+            task.cur_node->base() = static_cast<int>(flattened_idxs.size());
+            max_depth = std::max(max_depth, task.depth);
+            for (int prim_id : task.cur_node->prims) {
+                flattened_idxs.push_back(prim_id);
+            }
+        } else {
+            auto [lchild_task, rchild_task] = task.get_child_tasks();
+            iterate_sbvh_impl(lchild_task, iterate_sbvh_impl);
+            iterate_sbvh_impl(rchild_task, iterate_sbvh_impl);
+        }
+    };
+
+    iterate_sbvh_impl(cur_task, iterate_sbvh_impl);
+    return node_num;
 }
 
 static SBVHNode *sbvh_root_start(const std::vector<Vec3> &points1,
