@@ -522,6 +522,7 @@ class SBVHBuilderThreadSpan {
         for (std::future<Result_T> &future : futures) {
             reducer(result, future.get());
         }
+        return result;
     }
 
     template <typename Func_T, typename Result_T = std::result_of_t<Func_T()>>
