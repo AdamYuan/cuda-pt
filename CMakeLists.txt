@@ -4,27 +4,25 @@ cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
 set(PROJ_NAME "cuda-pt")
 project(${PROJ_NAME} LANGUAGES CUDA CXX)
 
-message(STATUS "Using SoA3 (struct of arrays) for GPU containers.")
-
 set(CUDA_COMMON_FLAGS --expt-relaxed-constexpr)
 
 find_package(Threads REQUIRED)
 find_package(OpenMP REQUIRED)
 if("${CMAKE_BUILD_TYPE}" STREQUAL "Debug"
-   OR "${CMAKE_BUILD_TYPE}" STREQUAL "debug"
-   OR "${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
+        OR "${CMAKE_BUILD_TYPE}" STREQUAL "debug"
+        OR "${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
   set(CMAKE_BUILD_TYPE Debug)
   if(MSVC)
     message(STATUS "MSVC: Building project in DEBUG mode.")
     set(CMAKE_CUDA_FLAGS
-        "${CMAKE_CUDA_FLAGS} -maxrregcount=40 -arch=native -g -G")
-    set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -g -lineinfo")
+            "${CMAKE_CUDA_FLAGS} -maxrregcount=40 -arch=native -g -G")
+    set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -g")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3 /g /Od /Zi /MDd")
   else()
     message(STATUS "GCC & G++: Building project in DEBUG mode.")
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
     set(CMAKE_CUDA_FLAGS
-        "${CMAKE_CUDA_FLAGS} -Wall -G -O0 -maxrregcount=40 -arch=native")
+            "${CMAKE_CUDA_FLAGS} -Wall -G -O0 -maxrregcount=40 -arch=native")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -g -O0 -fsanitize=leak")
   endif()
   set(CUDA_CONFIG_FLAGS -G --extended-lambda)
@@ -32,45 +30,45 @@ else()
   # to check register usage, please set "-Xptxas -v" to cap the register usage
   # to boost occupancy, set ""
   set(CMAKE_BUILD_TYPE Release)
+  if(MSVC)
+    if(OPENMP_FOUND)
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /openmp")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /openmp")
+      set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler /openmp")
+    else()
+      message(
+              FATAL_ERROR
+              "OpenMP can not be found but it is required by wavefront path tracer. Manual overriding is required to skip this exception."
+      )
+    endif()
+    message(STATUS "MSVC: Building project in RELEASE mode.")
+    set(CMAKE_CUDA_FLAGS
+            "${CMAKE_CUDA_FLAGS} -maxrregcount=40 -lineinfo -arch=native")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2")
+  else()
+    message(STATUS "GCC & G++: Building project in RELEASE mode.")
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(CMAKE_CUDA_FLAGS
+            "${CMAKE_CUDA_FLAGS} -O3 --maxrregcount=40 -lineinfo -arch=native")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+    if(OPENMP_FOUND)
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+      set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${OpenMP_CXX_FLAGS}")
+    else()
+      message(
+              FATAL_ERROR
+              "OpenMP can not be found but it is required by wavefront path tracer. Manual overriding is required to skip this exception."
+      )
+    endif()
+  endif()
+  add_compile_definitions(OPENMP_ENABLED)
   set(CUDA_CONFIG_FLAGS --extended-lambda --use_fast_math -Xptxas -O3)
-endif()
-if(MSVC)
-  if(OPENMP_FOUND)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /openmp")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /openmp")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler /openmp")
-  else()
-    message(
-            FATAL_ERROR
-            "OpenMP can not be found but it is required by wavefront path tracer. Manual overriding is required to skip this exception."
-    )
-  endif()
-  message(STATUS "MSVC: Building project in RELEASE mode.")
-  set(CMAKE_CUDA_FLAGS
-          "${CMAKE_CUDA_FLAGS} -maxrregcount=40 -lineinfo -arch=native")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2")
-else()
-  message(STATUS "GCC & G++: Building project in RELEASE mode.")
-  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-  set(CMAKE_CUDA_FLAGS
-          "${CMAKE_CUDA_FLAGS} -O3 --maxrregcount=40 -lineinfo -arch=native")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
-  if(OPENMP_FOUND)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${OpenMP_CXX_FLAGS}")
-  else()
-    message(
-            FATAL_ERROR
-            "OpenMP can not be found but it is required by wavefront path tracer. Manual overriding is required to skip this exception."
-    )
-  endif()
 endif()
 set(CUDA_FINAL_FLAGS ${CUDA_COMMON_FLAGS} ${CUDA_CONFIG_FLAGS})
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 include_directories(
