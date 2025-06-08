@@ -49,9 +49,12 @@ static constexpr float spatial_traverse_cost = 0.21f;
 static constexpr int max_allowed_depth = 96;
 // when number of triangles to process is less than the following,
 // the task will be executed locally instead of being queued
-static constexpr int workload_threshold = 512;
+static constexpr int queue_workload_threshold = 512;
+// when number of triangles to process is greater than the following,
+// `update_bin` will employ thread pool to accelerate binning
+static constexpr int workload_threshold = 128;
 static constexpr int number_of_workers = 8;
-static int max_depth = 0; // TODO: should not use global variable for this?
+static int max_depth = 0;
 
 // Wrapping building of a SBVH Node as a Task for queuing
 struct SBVHBuilderTask {
@@ -343,7 +346,7 @@ void SpatialSplitter<N>::update_bins(const std::vector<Vec3> &points1,
                                      const SBVHBuilderThreadSpan &threads,
                                      const SBVHNode *const cur_node) {
     // the following can be made faster by partitioning and multi-threading
-    if (threads.can_parallelize()) {
+    if (threads.can_parallelize() && cur_node->size() >= workload_threshold) {
         // multi-thread implementation
         std::vector<ChoppedBinningData> all_data(threads.get_parallelism());
 
@@ -850,7 +853,8 @@ static int recursive_sbvh_SAH(
                                             consume_task))
                     continue;
 
-                if (consume_task.cur_node->prim_num() < workload_threshold) {
+                if (consume_task.cur_node->prim_num() <
+                    queue_workload_threshold) {
                     recursive_sbvh_SAH_impl(threads, consume_task,
                                             recursive_sbvh_SAH_impl);
                     queued_task_count.fetch_sub(1, std::memory_order_release);
